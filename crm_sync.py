@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 from typing import Iterable
+from uuid import uuid4
 
-from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+from sqlalchemy import BigInteger, Column, MetaData, Table, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID, insert as pg_insert
 
 from models import db
+from batch_apply import apply_snapshot
 
+LOG = logging.getLogger(__name__)
 BATCH_SIZE = 250
 _METADATA = MetaData()
 
@@ -35,6 +40,7 @@ def json_compatible(value):
 
 
 def _serialize_special(value):
+
     from datetime import date, datetime
     from decimal import Decimal
     from uuid import UUID as UUIDType
@@ -76,6 +82,7 @@ def _links(items):
 
 
 def customer_row(customer, run_id):
+
     login = _field(customer, "Логин")
     if not login:
         return None
@@ -124,12 +131,10 @@ def lead_row(lead, run_id):
 def _insert_batch(table, rows):
     if not rows:
         return
-        
     rows = list({
         (row["run_id"], row["crm_id"]): row
         for row in rows
     }.values())
-
     stmt = pg_insert(table).values(rows)
     changes = {
         col: getattr(stmt.excluded, col)
@@ -143,8 +148,6 @@ def _insert_batch(table, rows):
 
 
 def _stage(iterator: Iterable, table, converter, run_id, batch_size, is_full, skipped_status):
-    if batch_size < 1:
-        raise ValueError("batch_size должен быть положительным")
     batch = []
     count = 0
     for entity in iterator:
@@ -160,3 +163,75 @@ def _stage(iterator: Iterable, table, converter, run_id, batch_size, is_full, sk
             batch.clear()
     _insert_batch(table, batch)
     return count
+
+
+def sync_crm(
+    customers: Iterable,
+    leads: Iterable,
+    *,
+    is_full: bool = True,
+    batch_size: int = BATCH_SIZE,
+    allow_empty_full: bool = False,
+):
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    run_id = uuid4()
+    with db.engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO crm_sync_runs(run_id, is_full) VALUES (:run_id, :is_full)"),
+            {"run_id": run_id, "is_full": is_full},
+        )
+
+    try:
+        customer_count = _stage(
+            customers, _CUSTOMERS, customer_row, run_id, batch_size, is_full, 111349,
+        )
+        lead_count = _stage(
+            leads, _LEADS, lead_row, run_id, batch_size, is_full, 143,
+        )
+        with db.engine.begin() as connection:
+            connection.execute(
+                text("""UPDATE crm_sync_runs
+                        SET status = 'ready', customers_count = :customers,
+                            leads_count = :leads WHERE run_id = :run_id
+                            AND status = 'loading'"""),
+                {"run_id": run_id, "customers": customer_count, "leads": lead_count},
+            )
+    except Exception:
+        LOG.exception("CRM collection failed; staging run %s will not be applied", run_id)
+
+        with db.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE crm_sync_runs SET status='failed' WHERE run_id=:run_id"),
+                {"run_id": run_id},
+            )
+        raise
+
+    try:
+        with db.engine.begin() as connection:
+            stats = apply_snapshot(
+                connection, run_id, allow_empty_full=allow_empty_full,
+                batch_size=batch_size,
+            )
+
+        db.session.expire_all()
+        LOG.info("CRM run %s completed: %s", run_id, stats)
+        return {"run_id": str(run_id), "stats": stats}
+    except Exception:
+
+        LOG.exception("CRM apply failed; run %s is still staged for inspection", run_id)
+        raise
+
+
+def install_schema(engine):
+    location = Path(__file__).resolve().parent
+    schema_text = (location / "schema.sql").read_text(encoding="utf-8")
+    schema_text = "\n".join(
+        line for line in schema_text.splitlines()
+        if not line.lstrip().startswith("--")
+    )
+    with engine.begin() as conn:
+        for statement in schema_text.split(";"):
+            if statement.strip():
+                conn.exec_driver_sql(statement)
+
