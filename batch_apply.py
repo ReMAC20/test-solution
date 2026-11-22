@@ -1,3 +1,11 @@
+"""Применение готовой выгрузки CRM.
+
+- Сопоставление по id и логину, создание строк и обновление JSONB происходит через
+  пакетные запросы в PostgreSQL.
+- Для пар с конфликтом разрешение происходит в merge.py
+- Вызывается в одной транзакции Connection (без промежуточного commit).
+"""
+
 from sqlalchemy import text
 from merge import merge_owners
 
@@ -11,6 +19,8 @@ _COLUMNS = {
 
 
 def _create_work_tables(connection):
+    """Временные таблицы живут только на соединении транзакции по применению."""
+    
     connection.exec_driver_sql("""
         CREATE TEMP TABLE _members (
             kind TEXT NOT NULL,
@@ -46,6 +56,8 @@ def _create_work_tables(connection):
 
 
 def _refresh_members(connection):
+    """JSONB-массивы в маленький индекс PostgreSQL"""
+    
     connection.execute(text("TRUNCATE _members"))
     connection.execute(text("""
         INSERT INTO _members(kind, crm_id, login, owner_id)
@@ -67,8 +79,9 @@ def _refresh_members(connection):
         ) AS elem(value)
         WHERE elem.value #>> '{general,id}' IS NOT NULL
     """))
-
-
+    
+    # Одинаковый crm id в разных AbstractCustomer делает поиск неоднозначным
+    # В этом случае не выбирается произвольная строка, как это было раньше с .first().
     duplicate = connection.execute(text("""
         SELECT kind, crm_id
         FROM _members
@@ -81,6 +94,11 @@ def _refresh_members(connection):
 
 
 def _match_customers(connection, run_id):
+    """CRM id -> однозначный логин среди сделок -> новая запись.
+
+    Все известные соответствия за один INSERT ... SELECT, а не на каждого
+    покупателя. Покупатели без логина уже не попадают в staging.
+    """
     connection.execute(text("""
         WITH ids AS (
             SELECT crm_id, MIN(owner_id) AS owner_id
@@ -102,7 +120,7 @@ def _match_customers(connection, run_id):
           AND COALESCE(ids.owner_id, by_login.owner_id) IS NOT NULL
     """), {"run_id": run_id})
 
-
+   
     created = connection.execute(text("""
         WITH created AS (
             INSERT INTO abstract_customer(amo_customers)
@@ -130,6 +148,11 @@ def _put_customers_into_incoming(connection, run_id):
 
 
 def _upsert_json_array(connection, kind):
+    """Одним UPDATE обновить всю группу владельцев, затронутых kind.
+
+    Из существующего массива остаются элементы, отсутствующие в новых данных;
+    для совпадающих general.id побеждает JSON из staging, а дубликаты удаляются
+    """
     column = _COLUMNS[kind]
     sql = f"""
         UPDATE abstract_customer AS ac
@@ -159,6 +182,7 @@ def _upsert_json_array(connection, kind):
 
 
 def _lead_matches_sql():
+
     return """
         WITH ids AS (
             SELECT crm_id, MIN(owner_id) AS owner_id
@@ -182,6 +206,11 @@ def _lead_matches_sql():
 
 
 def _merge_lead_conflicts(connection, run_id):
+    """Только конфликтные пары подгружаются целиком.
+
+    После каждого MERGE пересчитываем соответствия в SQL, поскольку
+    следующие сделки должны видеть новые ссылки на владельцев.
+    """
     merged = 0
     while True:
         conflict = connection.execute(text("""
@@ -227,6 +256,8 @@ def _match_leads(connection, run_id):
 
 
 def _put_all_into_incoming(connection, run_id):
+    """Из staging собрать уникальные полные JSONB-объекты всех четырёх видов."""
+
     connection.execute(text("TRUNCATE _incoming"))
     _put_customers_into_incoming(connection, run_id)
     connection.execute(text("""
@@ -237,7 +268,8 @@ def _put_all_into_incoming(connection, run_id):
         WHERE sl.run_id = :run_id
     """), {"run_id": run_id})
 
-
+    # Контакт может быть указан несколькими покупателями или сделками.
+    # По general.id, выбираем конкретную копию.
     connection.execute(text("""
         WITH links AS (
             SELECT t.owner_id, sc.crm_id AS parent_id,
@@ -263,7 +295,7 @@ def _put_all_into_incoming(connection, run_id):
         INSERT INTO _incoming(kind, owner_id, crm_id, payload)
         SELECT 'contact', owner_id, crm_id, payload FROM chosen
     """), {"run_id": run_id})
-
+    
     connection.execute(text("""
         WITH links AS (
             SELECT t.owner_id, sc.crm_id AS parent_id,
@@ -284,6 +316,7 @@ def _put_all_into_incoming(connection, run_id):
 
 
 def _apply_all(connection, is_full):
+    
     if is_full:
         connection.execute(text("""
             UPDATE abstract_customer AS ac
@@ -312,15 +345,20 @@ def _apply_all(connection, is_full):
               AND COALESCE(jsonb_array_length(amo_leads), 0) = 0
         """)).rowcount
 
-
+    # Делаем частичный прогон, сохраняем все старые элементы, заменяя только пришедшие.
     for kind in _COLUMNS:
         _upsert_json_array(connection, kind)
     return 0
 
 
 def apply_snapshot(connection, run_id, *, allow_empty_full=False, batch_size=250):
-    del batch_size
+    """Выполнять внутри `with db.engine.begin() as connection`.
 
+    batch_size сохранён для совместимости с crm_sync.sync_crm(),
+    но при применении SQL уже работает со всем staging целиком.
+    """
+    del batch_size
+    
     connection.execute(text("SELECT pg_advisory_xact_lock(2026, 61)"))
     connection.exec_driver_sql("LOCK TABLE abstract_customer IN SHARE ROW EXCLUSIVE MODE")
     run = connection.execute(text("""
@@ -348,7 +386,7 @@ def apply_snapshot(connection, run_id, *, allow_empty_full=False, batch_size=250
 
     created_customers = _match_customers(connection, run_id)
     _put_customers_into_incoming(connection, run_id)
-    _upsert_json_array(connection, "customer")
+    _upsert_json_array(connection, "customer")  # обновить логины перед поиском сделок
     _refresh_members(connection)
 
     merged = _merge_lead_conflicts(connection, run_id)

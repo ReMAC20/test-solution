@@ -1,3 +1,9 @@
+"""Загрузка данных CRM во вспомогательные таблицы для collect_leads_customers().
+
+Перед первой синхронизацией необходимо установить SQL-схему.
+Сетевые запросы к CRM все еще в исходном модуле amocrm.py.
+"""
+
 from __future__ import annotations
 
 import json
@@ -36,11 +42,16 @@ _LEADS = Table(
 
 
 def json_compatible(value):
+    """Преобразовать данные CRM в JSON-совместимый формат без потери значений.
+
+    Если тип значения неизвестен сериализатору, вызывается исключение.
+    """
     return json.loads(json.dumps(value, ensure_ascii=False, default=_serialize_special))
 
 
 def _serialize_special(value):
-
+    """Преобразовать дату, Decimal или UUID в значение, пригодное для JSON."""
+    # Даты и специальные типы переводим в строки в устойчивом формате.
     from datetime import date, datetime
     from decimal import Decimal
     from uuid import UUID as UUIDType
@@ -55,6 +66,11 @@ def _serialize_special(value):
 
 
 def _entity_json(entity):
+    """Получить словарь с полными данными CRM-сущности.
+
+    Если доступен метод as_dict(), используем его, если же нет берём атрибуты
+    объекта.
+    """
     if callable(getattr(entity, "as_dict", None)):
         return json_compatible(entity.as_dict())
     return json_compatible({
@@ -64,12 +80,14 @@ def _entity_json(entity):
 
 
 def _field(entity, name):
+    """Получить значение пользовательского поля CRM по его названию."""
     values = getattr(entity, "custom_fields_values", None) or {}
     item = values.get(name) or {}
     return item.get("value")
 
 
 def _links(items):
+    """Привести связанные контакты и компании к формату JSON основной БД."""
     result = []
     for item in items or []:
         if not isinstance(item, dict) or item.get("id") is None:
@@ -82,10 +100,11 @@ def _links(items):
 
 
 def customer_row(customer, run_id):
+    """Подготовить покупателя для загрузки в staging или пропустить без логина."""
 
     login = _field(customer, "Логин")
     if not login:
-        return None
+        return None  # По условию покупатели без логина не обрабатываются.
     crm_id = int(customer.id)
     return {
         "run_id": run_id,
@@ -110,6 +129,7 @@ def customer_row(customer, run_id):
 
 
 def lead_row(lead, run_id):
+    """Подготовить сделку и связанные контакты для загрузки в staging."""
     crm_id = int(lead.id)
     login = _field(lead, "Логин")
     return {
@@ -129,12 +149,16 @@ def lead_row(lead, run_id):
 
 
 def _insert_batch(table, rows):
+    """Вставить пакет в staging, а повторные CRM ID обновить через ON CONFLICT."""
+    
     if not rows:
         return
+
     rows = list({
         (row["run_id"], row["crm_id"]): row
         for row in rows
     }.values())
+
     stmt = pg_insert(table).values(rows)
     changes = {
         col: getattr(stmt.excluded, col)
@@ -144,10 +168,11 @@ def _insert_batch(table, rows):
         index_elements=[table.c.run_id, table.c.crm_id], set_=changes,
     )
     with db.engine.begin() as connection:
-        connection.execute(stmt)
+        connection.execute(stmt)  # Изменения staging фиксируются отдельной транзакцией.
 
 
 def _stage(iterator: Iterable, table, converter, run_id, batch_size, is_full, skipped_status):
+    """Прочитать итератор CRM, отфильтровать записи и записать их пакетами."""
     batch = []
     count = 0
     for entity in iterator:
@@ -173,6 +198,11 @@ def sync_crm(
     batch_size: int = BATCH_SIZE,
     allow_empty_full: bool = False,
 ):
+    """Загрузить CRM-данные и применить полную выгрузку атомарно.
+
+    Вызывается из main.collect_leads_customers(). Если получение данных оборвалось,
+    основная таблица AbstractCustomer не изменяется.
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     run_id = uuid4()
@@ -199,7 +229,7 @@ def sync_crm(
             )
     except Exception:
         LOG.exception("CRM collection failed; staging run %s will not be applied", run_id)
-
+        # Помечаем запуск как неуспешный, так, частичные данные остаются только в staging.
         with db.engine.begin() as connection:
             connection.execute(
                 text("UPDATE crm_sync_runs SET status='failed' WHERE run_id=:run_id"),
@@ -213,17 +243,21 @@ def sync_crm(
                 connection, run_id, allow_empty_full=allow_empty_full,
                 batch_size=batch_size,
             )
-
+        # После массового SQL ранее загруженные ORM-объекты могли устареть.
         db.session.expire_all()
         LOG.info("CRM run %s completed: %s", run_id, stats)
         return {"run_id": str(run_id), "stats": stats}
     except Exception:
-
+        # Контекст engine.begin() откатил все изменения основных таблиц.
         LOG.exception("CRM apply failed; run %s is still staged for inspection", run_id)
         raise
 
 
 def install_schema(engine):
+    """Создать staging-таблицы и индексы по схеме из schema.sql.
+
+    Вызывается перед первой синхронизацией.
+    """
     location = Path(__file__).resolve().parent
     schema_text = (location / "schema.sql").read_text(encoding="utf-8")
     schema_text = "\n".join(

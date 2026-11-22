@@ -1,9 +1,20 @@
+"""Обрабатывает следующий случай: объединение двух AbstractCustomer.
+
+Обычное сопоставление и обновление выполняются пакетами в batch_apply.py.
+Только конфликт (сделка и покупатель в разных строках) требует чтения
+двух полноценных JSONB-записей и их слияния.
+"""
+
 import json
 
 from sqlalchemy import text
 
 
 def merge_items(source, target):
+    """Сохранить элементы обоих массивов; для совпадающего general.id побеждает target.
+
+    Данные без general.id уникализируются по полному JSON-значению.
+    """
     result = {}
     for item in (source or []) + (target or []):
         key_id = (item.get("general") or {}).get("id") if isinstance(item, dict) else None
@@ -15,6 +26,10 @@ def merge_items(source, target):
 
 
 def merge_owners(connection, target, source):
+    """В одной транзакции перенести source в target и удалить source.
+
+    Работа без commit, границы транзакции определяются в crm_sync.sync_crm().
+    """
     if target == source:
         return
     rows = connection.execute(text("""
@@ -49,7 +64,7 @@ def merge_owners(connection, target, source):
     })
     connection.execute(text("DELETE FROM abstract_customer WHERE id = :source"), {"source": source})
 
-
+    # Временные поисковые таблицы обновляются сразу
     connection.execute(text("UPDATE _members SET owner_id = :target WHERE owner_id = :source"),
                        {"target": target, "source": source})
     connection.execute(text("UPDATE _customer_targets SET owner_id = :target WHERE owner_id = :source"),
